@@ -1,0 +1,12 @@
+import sys
+
+bkdir = '/storage/project/squidlet/blastkit/lib'
+
+if bkdir not in sys.path:
+    sys.path.insert(0, bkdir)
+
+SECRET_KEY = '\tD,\xb1\xd3\x89zd\x87\x8b\xb7\x9f\xf8c\x8e\x0eH\xdc\xb21\x9cY\xdcK'
+DEBUG = True
+PASSWORD = 'africanoreuropean?'
+
+import blastkit_config

@@ -1,0 +1,3 @@
+import blastkit
+blastkit.BLAST = '/usr/local/bin/blastall'
+blastkit.tempdir = '/u/cs.welcher/blastkit/tmpdir'

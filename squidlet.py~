@@ -1,0 +1,288 @@
+import sys
+import shutil
+import cPickle
+import traceback
+import os, os.path
+import time
+import screed
+from screed import ScreedDB
+from flask import Flask, request, session, g, redirect, url_for, abort, render_template, flash
+
+app = Flask(__name__)
+app.config.from_object('squidlet_config')
+app.debug = True
+
+import blastparser
+
+'''
+The main index function
+Check if the user is logged in; if so, send them on to the main page
+'''
+@app.route('/')
+def index():
+    if not session.get('logged_in'):
+        return redirect(url_for('login'))
+    return render_template('query.html', error=None)
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    error = None
+    if request.method == 'POST':
+        if request.form['password'] != app.config['PASSWORD']:
+            error = 'Invalid password'
+        else:
+            session['logged_in'] = True
+            flash('You were logged in')
+            return redirect(url_for('index'))
+    return render_template('login.html', error=error)
+
+@app.route('/logout')
+def logout():
+    session.pop('logged_in', None)
+    return redirect(url_for('index'))
+
+"""
+Intercepts the form data and splits processes for BLAST
+First it splits off a child process
+Then it receives the pid of that process, which will be used to check the status of the worker
+Then it redirects to the results page, sending the child pid
+"""
+@app.route('/submit')
+def submit():
+    if request.method == "POST" and isset(request.form['input']) and isset(request.form['sequence']) and isset(request.form['species']):
+        seqtype = request.form['input']
+        sequence = request.form['sequence']
+        species = request.form['species']
+        tempdir, dirstub = make_dir()
+        cpid = split_child(worker, (tempdir, species, seqtype, sequence))
+        print "boom!\nparent pid:{}\nchildpid:{}".format(os.getpid(), cpid)
+        return redirect('results/' + str(cpid))
+    else:
+        return "you don't belong here"
+
+"""
+The status checker
+First it checks for the existenceo of a file indicating the blast is complete, identified by the child pid
+If it doesn't exist, it returns the auto-refreshing template which will call this same function again
+If it does exist, it will grab the rendered template produced in the worker
+"""
+@app.route('/results/<fid>')
+def results(fid):
+    if os.path.isfile(fid):
+        return "yay!"
+    return """<head><META http-equiv="refresh" content="5;"></head><body>waiting...:(</body>"""
+
+def worker():
+    print "In the worker with pid {}".format(os.getpid())
+    time.sleep(10)
+    os.execlp('touch', 'touch', str(os.getpid()))
+
+def split_child(child_fn, child_fn_args):
+    """
+    Fork, and return the child pid to the parent process; in the child process,
+    detach from the controlling terminal and *then* run the child fn.
+    """
+    pid = detach()
+    if pid != 0:
+        print "Should be non-zero: {}".format(pid)
+        return pid
+    else:
+        print "Should be zero: {}".format(pid)
+        child_fn(*child_fn_args)
+        
+def detach():
+    """
+    Returns result of os.fork()
+    """
+    x = os.fork()
+    if x != 0:
+        return x
+
+    # run in child process; daemonize first
+    si = file("/dev/null", 'r')
+    so = file("/dev/null", 'a+')
+    se = file("/dev/null", 'a+', 0)
+    os.dup2(si.fileno(), sys.stdin.fileno())
+    os.dup2(so.fileno(), sys.stdout.fileno())
+    os.dup2(se.fileno(), sys.stderr.fileno())
+
+    os.setsid()
+
+    return x
+    
+def make_dir():
+    """
+    Make a working directory.
+    """
+    dir = tempfile.mkdtemp('', 'blast.', app.config['TEMPDIR'])
+    dirstub = dir[len(app.config['TEMPDIR']) + 1:]
+    #warning: uncommenting makes the temp directory accessible to all
+    #os.chmod(dir, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
+    return dir, dirstub
+    
+@app.route('/submit')
+def do_cgi():
+    """
+    Main CGI function.  Retrieve form information, set up task, return
+    placeholder, and spawn worker process.
+    """
+    # retrieve sequence from submitted form info
+    form = cgi.FieldStorage()
+    name = form['name'].value
+    if not name.strip():
+        name = 'query'
+
+    seqtype = form['input'].value
+    sequence = form['sequence'].value
+    species = form['species'].value
+
+    # make a working directory to save stuff in
+    tempdir, dirstub = blastkit.make_dir()
+
+    # write out the query sequence
+    fp = open('%s/query.fa' % (tempdir,), 'w')
+    fp.write('>%s\n%s\n' % (name, sequence,))
+    fp.close()
+
+    # write out the placeholder message
+    fp = open('%s/index.html' % (tempdir,), 'w')
+    fp.write(PLACEHOLDER_MESSAGE)
+    fp.close()
+
+    # fork response function / worker function
+    blastkit.split_execution(response_fn, (dirstub,),
+                             worker_fn, (seqtype, tempdir, species))
+
+
+
+@blastkit.write_tracebacks_to_file
+def worker_fn(seqtype, tempdir, species):
+    """
+    Run the BLAST and display the results.
+    """
+
+    dbfile = '/u/cs.welcher/assemblies/' + species + '/' + species + '_transcriptome.fa'
+    transcriptomedb = ScreedDB(dbfile)
+    newfile = tempdir + '/query.fa'
+
+    if seqtype == 'protein':
+        program = 'tblastn'
+    else:
+        program = 'blastn'
+    
+    out, err = blastkit.run_blast(program, newfile, dbfile, args=['-e 1e-6'])
+    dbgfp.write('Ran blast')
+    fp = open(tempdir + '/blast1-out.txt', 'w')
+    fp.write(out)
+    fp.close()
+
+    if err and err.strip():
+        fp = open(tempdir + '/blast1-err.txt', 'w')
+        fp.write(err)
+        fp.close()
+
+    transcriptome_results = blastparser.parse_string(out)
+
+    dbfile = '/u/cs.welcher/assemblies/' + species + '/' + species + '_genome.fa'
+    genomedb = ScreedDB(dbfile)
+    newfile = tempdir + '/query.fa'
+
+    if seqtype == 'protein':
+        program = 'tblastn'
+    else:
+        program = 'blastn'
+        
+    out, err = blastkit.run_blast(program, newfile, dbfile, args=['-e 1e-6'])
+
+    fp = open(tempdir + '/blast2-out.txt', 'w')
+    fp.write(out)
+    fp.close()
+
+    if err and err.strip():
+        fp = open(tempdir + '/blast2-err.txt', 'w')
+        fp.write(err)
+        fp.close()
+
+    genome_results = list(blastparser.parse_string(out))
+
+    '''dbfile = genedb
+    newfile = tempdir + '/' + 'query.fa'
+
+    if seqtype == 'protein':
+        program = 'tblastn'
+    else:
+        program = 'blastn'
+        
+    out, err = blastkit.run_blast(program, newfile, dbfile, args=['-e 1e-6'])
+    
+    fp = open(tempdir + '/blast3-out.txt', 'w')
+    fp.write(out)
+    fp.close()
+
+    if err and err.strip():
+        fp = open(tempdir + '/blast3-err.txt', 'w')
+        fp.write(err)
+        fp.close()
+
+    results = list(blastparser.parse_string(out))
+    '''
+
+    g.results = (transcriptome_results, genome_results)
+    
+    
+    
+    
+    fp = open(tempdir + '/index.html', 'w')
+    fp.write('<html><head><link rel="stylesheet" type="text/css" href="http://lyorn.idyll.org/~cs.welcher/www/blaststyle.css"></head><body>')
+    fp.write('<h1>BLAST complete. </h1>')
+    fp.write('<div class="output"><p>See <a href="transcriptome_results.html">mRNAseq blast output.</a></p>')
+    fp.write('<p>See <a href="genome_results.html">genome blast output.</a></p>')
+    #fp.write('<p>See <a href="blast3-out.txt">predicted genes blast output.</a></p>')
+    fp.write('</div>')
+    fp.close()
+
+    write_results(tempdir, transcriptome_results, "transcriptome", "blast1-out.txt", seqtype, transcriptomedb)
+    write_results(tempdir, genome_results, "genome", "blast2-out.txt", seqtype, genomedb)
+    
+    return
+
+def write_results(tempdir, results, title, raw_results, seqtype, screeddb):
+    fp = open(tempdir + "/" + title + "_results.html", 'w')
+    fp.write('<html><head><link rel="stylesheet" type="text/css" href="http://lyorn.idyll.org/~cs.welcher/www/style.css"></head><body>')
+    
+    fp.write("<div class='section'><h1>" + title + " Results</h1></div><div class='hit'>")
+    results_handle = open(tempdir + "/" + raw_results, 'r')
+    for i in range(0,19 if seqtype=='protein' else 13):
+        fp.write(results_handle.readline() + "<br>")
+    fp.write("<p><i>Click for raw <a href='" + raw_results + "'>results</a></i></p></div>")
+    fp.write("<div class='section'><h1>" + title + " Summary</h1></div>")
+
+    for record in results:
+        #rechtml = '''<div><h2 class='query'>Query: %s</h2>''' % (record.query_name, )
+        rechtml = '<div>'
+        fp.write(rechtml)
+        
+        for hit in record.hits:
+            hithtml = '''<div class="hit"><h3>Subject: %s</h3>''' % (str(screeddb[hit.subject_name].fullname),)
+
+            fp.write(hithtml)
+            for sbm in hit:
+                sbmhtml = '''<p>Length: %sbp</p>
+                            <p>Score: %s bits</p>
+                            <p>Expect: %s</p>
+                ''' % ( len(sbm.query_sequence), sbm.score, sbm.expect, )
+
+                
+                fp.write(sbmhtml)
+
+                fastaseq = '''<div><h3>FASTA Subject Sequence</h3><textarea class="fastaseq">%s</textarea></div>''' % (">" + str(screeddb[hit.subject_name].fullname) + " " + str(screeddb[hit.subject_name].description)  + "\n" + str(screeddb[hit.subject_name].sequence),)
+                fp.write(fastaseq)
+                
+            fp.write('</div>')
+        fp.write('</div>')
+    fp.write('</body></html>')
+    fp.close()
+    return
+    
+if __name__ == '__main__':
+    app.run()
